@@ -1,0 +1,293 @@
+
+# # Mobility hierarchy and performance portability
+#
+# Top row: raw outcome means by event time
+# Bottom row: event-study coefficients after author-specific linear detrending
+#
+# Assumptions:
+# - BigQuery table already contains merged mobility_type
+# - mobility_type values are: upward, lateral, downward
+# - event_time is centered on the move and ranges from -5 to 5
+
+# %%
+from google.cloud import bigquery
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.formula.api as smf
+
+# ----------------------------
+# User settings
+# ----------------------------
+PROJECT_ID = "mobility-hierarchy"
+DATASET_ID = "analysis"
+TABLE_ID = "author_event_panel_merged"
+
+TABLE = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
+client = bigquery.Client(project=PROJECT_ID)
+
+# %%
+# ----------------------------
+# Load data from BigQuery
+# ----------------------------
+sql = f"""
+SELECT
+  author_id,
+  PersonId,
+  year,
+  pubs,
+  avg_fwci,
+  top1_count,
+  top10_count,
+  corresponding_count,
+  UnitId,
+  RankTypeId,
+  DegreeYear,
+  Gender,
+  move_year,
+  event_time,
+  mobility_type
+FROM {TABLE}
+WHERE event_time BETWEEN -5 AND 5
+  AND mobility_type IN ('upward', 'lateral', 'downward')
+"""
+
+df = client.query(sql).to_dataframe()
+
+# Basic cleaning
+df["event_time"] = pd.to_numeric(df["event_time"], errors="coerce")
+df["pubs"] = pd.to_numeric(df["pubs"], errors="coerce")
+df["avg_fwci"] = pd.to_numeric(df["avg_fwci"], errors="coerce")
+df["top1_count"] = pd.to_numeric(df["top1_count"], errors="coerce")
+
+df = df.dropna(subset=["author_id", "event_time", "mobility_type"]).copy()
+df["event_time"] = df["event_time"].astype(int)
+
+# Optional: keep only complete windows if needed
+# df = df.groupby("author_id").filter(lambda g: set(range(-5, 6)).issubset(set(g["event_time"])))
+
+# %%
+# ----------------------------
+# Raw outcomes
+# ----------------------------
+df["log_pubs"] = np.log1p(df["pubs"])
+df["log_fwci"] = np.log(df["avg_fwci"].clip(lower=1e-8))
+df["top1_rate"] = np.where(df["pubs"] > 0, df["top1_count"] / df["pubs"], np.nan)
+df["top1_share_pct"] = 100 * df["top1_rate"]
+
+# %%
+# ----------------------------
+# Author-specific linear detrending
+# Y_it = a_i + b_i t + u_it
+# residual = Y_it - (a_i + b_i t)
+# ----------------------------
+def residualize_by_author(data: pd.DataFrame, y_col: str, id_col: str = "author_id", t_col: str = "event_time"):
+    resid = pd.Series(index=data.index, dtype="float64")
+
+    for _, sub in data[[id_col, t_col, y_col]].dropna().groupby(id_col):
+        if len(sub) < 2:
+            resid.loc[sub.index] = np.nan
+            continue
+
+        x = sub[t_col].astype(float).to_numpy()
+        y = sub[y_col].astype(float).to_numpy()
+
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = np.sum((x - x_mean) ** 2)
+
+        if denom == 0:
+            resid.loc[sub.index] = y - y.mean()
+            continue
+
+        b = np.sum((x - x_mean) * (y - y_mean)) / denom
+        a = y_mean - b * x_mean
+        fitted = a + b * x
+
+        resid.loc[sub.index] = y - fitted
+
+    return resid
+
+df["resid_log_pubs"] = residualize_by_author(df, "log_pubs")
+df["resid_log_fwci"] = residualize_by_author(df, "log_fwci")
+df["resid_top1_share_pct"] = residualize_by_author(df, "top1_share_pct")
+
+# %%
+# ----------------------------
+# Event-study regression on detrended outcomes
+# Normalized to event_time = -1
+# We estimate separate models by mobility_type:
+#   residual_outcome ~ C(event_time, Treatment(reference=-1))
+# Then extract coefficients and 95% CIs.
+# ----------------------------
+def event_study_coefficients(data: pd.DataFrame, y_col: str, group_col: str = "mobility_type"):
+    results = []
+
+    for mob in ["upward", "lateral", "downward"]:
+        sub = data.loc[data[group_col] == mob, ["event_time", y_col]].dropna().copy()
+
+        # Make event_time categorical so -1 is the omitted baseline
+        sub["event_time_cat"] = pd.Categorical(sub["event_time"], categories=list(range(-5, 6)), ordered=True)
+
+        # OLS with intercept and event-time indicators; baseline = -1
+        model = smf.ols(f"{y_col} ~ C(event_time_cat, Treatment(reference=-1))", data=sub).fit(cov_type="HC1")
+
+        # Baseline coefficient at event_time = -1 is 0 by construction
+        results.append({
+            "mobility_type": mob,
+            "event_time": -1,
+            "coef": 0.0,
+            "ci_low": 0.0,
+            "ci_high": 0.0
+        })
+
+        for k in range(-5, 6):
+            if k == -1:
+                continue
+
+            term = f"C(event_time_cat, Treatment(reference=-1))[T.{k}]"
+            if term not in model.params.index:
+                continue
+
+            coef = model.params[term]
+            se = model.bse[term]
+            results.append({
+                "mobility_type": mob,
+                "event_time": k,
+                "coef": coef,
+                "ci_low": coef - 1.96 * se,
+                "ci_high": coef + 1.96 * se
+            })
+
+    return pd.DataFrame(results)
+
+# %%
+# ----------------------------
+# Raw means and CIs for top row
+# ----------------------------
+def summarize_raw(data: pd.DataFrame, y_col: str):
+    by_type = (
+        data.groupby(["mobility_type", "event_time"], dropna=False)[y_col]
+        .agg(mean="mean", sd="std", n="count")
+        .reset_index()
+    )
+    by_type["se"] = by_type["sd"] / np.sqrt(by_type["n"])
+    by_type["ci_low"] = by_type["mean"] - 1.96 * by_type["se"]
+    by_type["ci_high"] = by_type["mean"] + 1.96 * by_type["se"]
+
+    all_series = (
+        data.groupby("event_time", dropna=False)[y_col]
+        .agg(mean="mean", sd="std", n="count")
+        .reset_index()
+    )
+    all_series["se"] = all_series["sd"] / np.sqrt(all_series["n"])
+    all_series["ci_low"] = all_series["mean"] - 1.96 * all_series["se"]
+    all_series["ci_high"] = all_series["mean"] + 1.96 * all_series["se"]
+    all_series["mobility_type"] = "All"
+
+    out = pd.concat(
+        [all_series[["mobility_type", "event_time", "mean", "ci_low", "ci_high"]],
+         by_type[["mobility_type", "event_time", "mean", "ci_low", "ci_high"]]],
+        ignore_index=True
+    )
+    return out
+
+raw_log_pubs = summarize_raw(df, "log_pubs")
+raw_log_fwci = summarize_raw(df, "log_fwci")
+raw_top1 = summarize_raw(df, "top1_share_pct")
+
+# Bottom row: detrended event-study coefficients
+es_log_pubs = event_study_coefficients(df, "resid_log_pubs")
+es_log_fwci = event_study_coefficients(df, "resid_log_fwci")
+es_top1 = event_study_coefficients(df, "resid_top1_share_pct")
+
+# %%
+# ----------------------------
+# Plot helpers
+# ----------------------------
+order = ["All", "upward", "lateral", "downward"]
+colors = {
+    "All": "#1f77b4",
+    "upward": "#ff7f0e",
+    "lateral": "#2ca02c",
+    "downward": "#d62728",
+}
+
+def draw_raw_panel(ax, panel_df, ylabel):
+    for mob in order:
+        sub = panel_df[panel_df["mobility_type"] == mob].sort_values("event_time")
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["event_time"], sub["mean"],
+            marker="o", linewidth=2,
+            label=mob.capitalize(), color=colors[mob]
+        )
+        ax.fill_between(
+            sub["event_time"], sub["ci_low"], sub["ci_high"],
+            alpha=0.18, color=colors[mob], linewidth=0
+        )
+    ax.axvline(0, color="steelblue", linewidth=1)
+    ax.axhline(0, color="black", linewidth=0.8, alpha=0.6)
+    ax.set_xlabel("Years Relative to Move")
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(range(-5, 6, 1))
+    ax.grid(alpha=0.15)
+    ax.legend(frameon=False, fontsize=8, loc="best")
+
+def draw_coef_panel(ax, panel_df, ylabel):
+    for mob in ["upward", "lateral", "downward"]:
+        sub = panel_df[panel_df["mobility_type"] == mob].sort_values("event_time")
+        if sub.empty:
+            continue
+        ax.plot(
+            sub["event_time"], sub["coef"],
+            marker="o", linewidth=2,
+            label=mob.capitalize(), color=colors[mob]
+        )
+        ax.fill_between(
+            sub["event_time"], sub["ci_low"], sub["ci_high"],
+            alpha=0.18, color=colors[mob], linewidth=0
+        )
+
+    ax.axvline(0, color="steelblue", linewidth=1)
+    ax.axhline(0, color="black", linewidth=0.8, alpha=0.6)
+    ax.axhline(0, color="black", linewidth=0.8, alpha=0.6)
+    ax.set_xlabel("Years Relative to Move")
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(range(-5, 6, 1))
+    ax.grid(alpha=0.15)
+    ax.legend(frameon=False, fontsize=8, loc="best")
+
+# %%
+# ----------------------------
+# 2 x 3 figure
+# Top row = raw trajectories
+# Bottom row = detrended event-study coefficients
+# ----------------------------
+fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=True)
+plt.subplots_adjust(wspace=0.25, hspace=0.3)
+
+# Top row: raw
+draw_raw_panel(axes[0, 0], raw_log_pubs, "Raw log Publications")
+draw_raw_panel(axes[0, 1], raw_log_fwci, "Raw log FWCI")
+draw_raw_panel(axes[0, 2], raw_top1, "Raw Top 1% Share (%)")
+
+# Bottom row: detrended coefficients
+draw_coef_panel(axes[1, 0], es_log_pubs, "Detrended log Publications")
+draw_coef_panel(axes[1, 1], es_log_fwci, "Detrended log FWCI")
+draw_coef_panel(axes[1, 2], es_top1, "Detrended Top 1% Share (%)")
+
+# Optional row labels
+axes[0, 0].set_title("Raw")
+axes[1, 0].set_title("Detrended event-study coefficients")
+
+fig.suptitle("Faculty Mobility and Research Performance Around Moves", y=1.02, fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# %%
+# ----------------------------
+# Optional: inspect coefficient tables
+# ----------------------------
+es_log_pubs.sort_values(["mobility_type", "event_time"])
